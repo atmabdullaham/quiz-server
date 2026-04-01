@@ -21,7 +21,8 @@ app.use(express.json());
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
-  'https://quiz-platform-3d14e.web.app'
+  'https://quiz-platform-3d14e.web.app',
+  'https://quiz-server-kappa.vercel.app'
 ];
 
 app.use(cors({
@@ -42,6 +43,23 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/quiz-plat
   useUnifiedTopology: true
 }).then(() => console.log('MongoDB connected'))
   .catch(err => console.error('MongoDB connection error:', err));
+
+// ✅ ROOT ROUTE - Health Check
+app.get('/', (req, res) => {
+  res.json({
+    message: '✅ Quiz Platform Backend API is Running',
+    status: 'online',
+    version: '1.0.0',
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      auth: '/auth/register, /auth/user',
+      quizzes: '/api/quizzes, /api/quizzes/:id',
+      submissions: '/api/submissions',
+      leaderboard: '/api/quizzes/:id/leaderboard',
+      admin: '/api/admin/*'
+    }
+  });
+});
 
 // User Schema
 const userSchema = new mongoose.Schema({
@@ -890,6 +908,22 @@ app.put('/api/student-profile', authenticateUser, async (req, res) => {
     console.error('Error updating student profile:', error);
     res.status(500).json({ message: error.message || 'Failed to update student profile' });
   }
+});
+
+// 404 Handler - Catch all undefined routes
+app.use((req, res) => {
+  res.status(404).json({
+    message: 'Endpoint not found',
+    path: req.path,
+    method: req.method,
+    availableEndpoints: {
+      root: 'GET /',
+      auth: ['POST /auth/register', 'GET /auth/user'],
+      quizzes: ['GET /api/quizzes', 'GET /api/quizzes/:id', 'POST /api/admin/quizzes'],
+      submissions: ['POST /api/submissions', 'GET /api/submissions/:id'],
+      leaderboard: 'GET /api/quizzes/:id/leaderboard'
+    }
+  });
 });
 
 const PORT = process.env.PORT || 5000;
