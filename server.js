@@ -44,20 +44,12 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/quiz-plat
 }).then(() => console.log('MongoDB connected'))
   .catch(err => console.error('MongoDB connection error:', err));
 
-// ✅ ROOT ROUTE - Health Check
+// ✅ ROOT ROUTE - Health Check (Minimal - No Endpoint Disclosure for Security)
 app.get('/', (req, res) => {
   res.json({
-    message: '✅ Quiz Platform Backend API is Running',
+    message: '✅ Quiz Platform Backend API',
     status: 'online',
-    version: '1.0.0',
-    timestamp: new Date().toISOString(),
-    endpoints: {
-      auth: '/auth/register, /auth/user',
-      quizzes: '/api/quizzes, /api/quizzes/:id',
-      submissions: '/api/submissions',
-      leaderboard: '/api/quizzes/:id/leaderboard',
-      admin: '/api/admin/*'
-    }
+    version: '1.0.0'
   });
 });
 
