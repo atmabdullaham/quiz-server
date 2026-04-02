@@ -10,7 +10,16 @@ dotenv.config();
 
 const app = express();
 
+if (!process.env.FIREBASE_ADMIN_CREDENTIALS) {
+  throw new Error("Missing FIREBASE_ADMIN_CREDENTIALS in backend environment.");
+}
+
 const serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_CREDENTIALS);
+
+if (!serviceAccount.private_key) {
+  throw new Error("Invalid FIREBASE_ADMIN_CREDENTIALS: private_key is missing.");
+}
+
 serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
 
 admin.initializeApp({
@@ -21,8 +30,10 @@ app.use(express.json());
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
-  'https://quiz-platform-3d14e.web.app',
-  'https://quiz-server-kappa.vercel.app'
+  ...((process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)),
 ];
 
 app.use(cors({
