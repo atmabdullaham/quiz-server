@@ -101,6 +101,30 @@ connectMongoDB().catch(err => {
   process.exit(1);
 });
 
+// ⚠️ FIX: Drop old broken index if it exists (E11000 duplicate key fix)
+async function cleanupOldIndexes() {
+  try {
+    const submissionCollection = mongoose.connection.collection('submissions');
+    
+    // Try to drop the old broken index
+    try {
+      await submissionCollection.dropIndex('quizId_1_mobileNumber_1');
+      console.log('✅ Dropped old broken index: quizId_1_mobileNumber_1');
+    } catch (err) {
+      if (err.message.includes('index not found')) {
+        console.log('ℹ️  No old index to clean up');
+      } else {
+        console.error('⚠️  Error cleaning up indexes:', err.message);
+      }
+    }
+  } catch (err) {
+    console.error('⚠️  Could not cleanup indexes:', err.message);
+  }
+}
+
+// Run cleanup after connection is established
+setTimeout(cleanupOldIndexes, 2000);
+
 // ✅ ROOT ROUTE - Health Check (Minimal - No Endpoint Disclosure for Security)
 app.get('/', (req, res) => {
   res.json({
@@ -110,22 +134,51 @@ app.get('/', (req, res) => {
   });
 });
 
-// User Schema
+// User Schema - VERSION 2 (Consolidated with profile + statistics)
 const userSchema = new mongoose.Schema({
   firebaseUid: { type: String, required: true, unique: true },
   email: String,
   name: String,
   picture: String,
   role: { type: String, enum: ['user', 'admin'], default: 'user' },
-  createdAt: { type: Date, default: Date.now }
+  
+  // VERSION 2: Profile data (migrated from StudentProfile)
+  profile: {
+    studentName: String,
+    schoolName: String,
+    className: String,
+    rollNumber: String,
+    mobileNumber: String,        // NOT unique per decision (can be shared)
+    address: String,
+    createdAt: Date,
+    updatedAt: { type: Date, default: Date.now }
+  },
+  
+  // VERSION 2: Statistics tracking
+  studentStatistics: {
+    totalQuizzesAttempted: { type: Number, default: 0 },
+    totalPoints: { type: Number, default: 0 },
+    quizzesWon: { type: Number, default: 0 },
+    lastQuizTakenAt: Date,
+    lastPointsUpdatedAt: Date
+  },
+  
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
 });
+
+// VERSION 2: Add indexes for new profile fields
+userSchema.index({ 'profile.mobileNumber': 1 });      // NOT unique (decision 1)
+userSchema.index({ 'profile.className': 1 });
+userSchema.index({ 'profile.rollNumber': 1 });
 
 const User = mongoose.model('User', userSchema);
 
-// StudentProfile Schema - Stores student information separately
+// VERSION 2: StudentProfile deprecated - consolidated into User.profile
+// Kept commented for reference during transition
+/*
 const studentProfileSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // Optional for public users
-  email: { type: String, required: true }, // Email for uniqueness with phone
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   studentName: { type: String, required: true }, // নাম
   schoolName: { type: String, required: true }, // শিক্ষা প্রতিষ্ঠান
   className: { type: String, required: true }, // ক্লাস/শ্রেণি/বর্ষ
@@ -136,14 +189,14 @@ const studentProfileSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
-// Compound unique index: (mobileNumber + email) - prevents duplicate phone+email combos
-studentProfileSchema.index({ mobileNumber: 1, email: 1 }, { unique: true });
-// Index on userId for fast lookups (if user is authenticated)
-studentProfileSchema.index({ userId: 1 }, { sparse: true, unique: true });
-// Index on email for public user lookups
-studentProfileSchema.index({ email: 1 });
+// Index on userId for fast lookups
+studentProfileSchema.index({ userId: 1 }, { unique: true });
+// Index on mobileNumber for public user lookups
+studentProfileSchema.index({ mobileNumber: 1 });
 
 const StudentProfile = mongoose.model('StudentProfile', studentProfileSchema);
+*/
+const StudentProfile = null; // Placeholder for compatibility
 
 // Quiz Schema
 const quizSchema = new mongoose.Schema({
@@ -166,39 +219,55 @@ const quizSchema = new mongoose.Schema({
 
 const Quiz = mongoose.model('Quiz', quizSchema);
 
-// Submission Schema - UPDATED with student info and StudentProfile reference
+// Submission Schema - VERSION 2 (Only userId, studentProfileId deprecated)
 const submissionSchema = new mongoose.Schema({
   quizId: { type: mongoose.Schema.Types.ObjectId, ref: 'Quiz', required: true },
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // Optional for public submissions
-  studentProfileId: { type: mongoose.Schema.Types.ObjectId, ref: 'StudentProfile', required: true }, // Reference to StudentProfile (required)
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, // VERSION 2: Now required
+  
   // Quiz data
-  answers: [{
-    questionId: String,
+  userAnswers: [{
+    questionIndex: Number,
     selectedOption: Number,
     isCorrect: Boolean
   }],
   score: { type: Number, default: 0 },
   totalQuestions: Number,
   submittedAt: { type: Date, default: Date.now },
-  timeTaken: Number
+  timeTaken: Number,
+  
+  // VERSION 2: New fields
+  answersLocked: { type: Boolean, default: true },   // Unlock when result published
+  isDuplicateFlag: { type: Boolean, default: false } // Flagged by class+roll+phone
 });
 
-// Compound index to ensure one submission per quiz per user (if userId exists)
-submissionSchema.index({ quizId: 1, userId: 1 }, { sparse: true, unique: true });
-// Index for public users via studentProfileId
-submissionSchema.index({ quizId: 1, studentProfileId: 1 }, { sparse: true, unique: true });
+// VERSION 2: Unique index on userId + quizId (decision 2: no retakes)
+submissionSchema.index({ quizId: 1, userId: 1 }, { unique: true });
 
 const Submission = mongoose.model('Submission', submissionSchema);
 
-// Published Result Schema
+// Published Result Schema - VERSION 2 (Updated for new structure)
 const publishedResultSchema = new mongoose.Schema({
   quizId: { type: mongoose.Schema.Types.ObjectId, ref: 'Quiz', required: true },
-  publishType: { type: String, enum: ['classwise', 'overall'], required: true },
-  winners: [{
-    studentProfileId: { type: mongoose.Schema.Types.ObjectId, ref: 'StudentProfile', required: true },
+  
+  // VERSION 2: Simple boolean flag for answer unlock
+  isPublished: { type: Boolean, default: true },
+  
+  // VERSION 2: List of top winners (userId only)
+  topWinners: [{
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     score: Number,
     position: Number // 1, 2, 3, etc.
   }],
+  
+  // VERSION 2: Metadata about publishing
+  resultMetadata: {
+    totalSubmissions: Number,
+    uniqueParticipants: Number,
+    duplicateFlagsFiltered: Number,
+    topScoreAchieved: Number,
+    topCountConfigured: Number // How many top winners (decision 3: admin decides)
+  },
+  
   publishedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   publishedAt: { type: Date, default: Date.now },
   createdAt: { type: Date, default: Date.now }
@@ -342,13 +411,12 @@ app.get('/api/quizzes', async (req, res) => {
   }
 });
 
-// Check if user has already submitted a quiz - using Phone + Email composite for public users
+// Check if user has already submitted a quiz
 app.get('/api/quizzes/:id/check-submission', optionalAuth, async (req, res) => {
   try {
-    const { mobileNumber, email } = req.query;
+    const { mobileNumber } = req.query;
     
     let submission;
-    let phoneConflict = null;
     
     if (req.user) {
       // Authenticated user - check by userId
@@ -356,38 +424,20 @@ app.get('/api/quizzes/:id/check-submission', optionalAuth, async (req, res) => {
         quizId: req.params.id,
         userId: req.user._id
       });
-    } else if (mobileNumber && email) {
-      // Public user - find StudentProfile by (phone + email), then check submission
-      const studentProfile = await StudentProfile.findOne({ 
-        mobileNumber: mobileNumber,
-        email: email 
-      });
-      
+    } else if (mobileNumber) {
+      // Public user - find StudentProfile first, then check submission
+      const studentProfile = await StudentProfile.findOne({ mobileNumber });
       if (studentProfile) {
         submission = await Submission.findOne({
           quizId: req.params.id,
           studentProfileId: studentProfile._id
         });
-      } else {
-        // Check if phone exists with DIFFERENT email
-        const phoneWithDifferentEmail = await StudentProfile.findOne({
-          mobileNumber: mobileNumber,
-          email: { $ne: email }
-        });
-        
-        if (phoneWithDifferentEmail) {
-          phoneConflict = {
-            message: `This phone is registered to ${phoneWithDifferentEmail.email}`,
-            registeredEmail: phoneWithDifferentEmail.email
-          };
-        }
       }
     }
     
     res.json({ 
       hasSubmitted: !!submission,
-      submission: submission || null,
-      phoneConflict: phoneConflict
+      submission: submission || null
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -452,8 +502,101 @@ app.delete('/api/admin/quizzes/:id', authenticateUser, isAdmin, async (req, res)
   }
 });
 
-// Submit quiz - UPDATED with Phone + Email composite key
-app.post('/api/quizzes/:id/submit', optionalAuth, async (req, res) => {
+// ============================================
+// USER PROFILE ENDPOINTS - VERSION 2
+// ============================================
+
+// Get current user's profile and statistics
+app.get('/api/user/profile', authenticateUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('profile studentStatistics email name picture role createdAt');
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    res.json({
+      _id: user._id,
+      email: user.email,
+      name: user.name,
+      picture: user.picture,
+      role: user.role,
+      profile: user.profile || {},
+      statistics: user.studentStatistics || {
+        totalQuizzesAttempted: 0,
+        totalPoints: 0,
+        quizzesWon: 0,
+        lastQuizTakenAt: null
+      },
+      createdAt: user.createdAt
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Update current user's profile
+app.put('/api/user/profile', authenticateUser, async (req, res) => {
+  try {
+    const { studentName, schoolName, className, rollNumber, mobileNumber, address } = req.body;
+    
+    // VERSION 2: Validate required fields
+    if (!studentName || !schoolName || !className) {
+      return res.status(400).json({ 
+        message: 'Required fields missing: studentName, schoolName, className' 
+      });
+    }
+    
+    const updatedUser = await User.findByIdAndUpdate(
+      req.user._id,
+      {
+        $set: {
+          'profile.studentName': studentName,
+          'profile.schoolName': schoolName,
+          'profile.className': className,
+          'profile.rollNumber': rollNumber || '',
+          'profile.mobileNumber': mobileNumber || '',
+          'profile.address': address || '',
+          'profile.updatedAt': new Date()
+        }
+      },
+      { new: true }
+    ).select('profile email name');
+    
+    res.json({
+      message: 'Profile updated successfully',
+      profile: updatedUser.profile
+    });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Get current user's statistics
+app.get('/api/user/statistics', authenticateUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('studentStatistics');
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    res.json({
+      statistics: user.studentStatistics || {
+        totalQuizzesAttempted: 0,
+        totalPoints: 0,
+        quizzesWon: 0,
+        lastQuizTakenAt: null,
+        lastPointsUpdatedAt: null
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Submit quiz - VERSION 2 (Consolidated profile, statistics updates, answer locking)
+app.post('/api/quizzes/:id/submit', authenticateUser, async (req, res) => {
   try {
     const quiz = await Quiz.findById(req.params.id);
     
@@ -461,153 +604,76 @@ app.post('/api/quizzes/:id/submit', optionalAuth, async (req, res) => {
       return res.status(404).json({ message: 'Quiz not found' });
     }
     
-    const { answers, timeTaken, studentInfo } = req.body;
+    const { answers, timeTaken, profileData } = req.body;
     
-    // Validate student info
-    if (!studentInfo || !studentInfo.studentName || !studentInfo.schoolName || !studentInfo.className) {
-      return res.status(400).json({ message: 'Student information is required' });
-    }
-    
-    // Get email from authenticated user or request
-    let email = req.user?.email;
-    if (req.user) {
-      // Authenticated user - must use their email
-      email = req.user.email;
-    } else {
-      // Public user - get email from request
-      if (!studentInfo.email) {
-        return res.status(400).json({ message: 'Email is required for public submission' });
-      }
-      email = studentInfo.email;
-    }
-    
-    // Require mobile number
-    if (!studentInfo.mobileNumber) {
-      return res.status(400).json({ message: 'Mobile number is required' });
-    }
-    
-    // Check if already submitted - by userId for authenticated, by (phone + email) for public
-    let existingSubmission;
-    
-    if (req.user) {
-      // Authenticated user - check by userId
-      existingSubmission = await Submission.findOne({
-        quizId: req.params.id,
-        userId: req.user._id
-      });
-    } else {
-      // Public user - check by studentProfileId (after finding profile by phone+email)
-      const publicProfile = await StudentProfile.findOne({
-        mobileNumber: studentInfo.mobileNumber,
-        email: email
-      });
-      
-      if (publicProfile) {
-        existingSubmission = await Submission.findOne({
-          quizId: req.params.id,
-          studentProfileId: publicProfile._id
-        });
+    // VERSION 2: Validate profile data
+    if (profileData) {
+      const { studentName, schoolName, className } = profileData;
+      if (!studentName || !schoolName || !className) {
+        return res.status(400).json({ message: 'Profile data incomplete (studentName, schoolName, className required)' });
       }
     }
+    
+    // VERSION 2: DECISION 2 - Check duplicate by userId + quizId (one attempt per quiz)
+    const existingSubmission = await Submission.findOne({
+      quizId: req.params.id,
+      userId: req.user._id
+    });
     
     if (existingSubmission) {
-      return res.status(400).json({ message: 'You have already submitted this quiz' });
-    }
-    
-    // Create or update StudentProfile using (phone + email) composite key
-    let studentProfileId = null;
-    let studentProfile;
-    
-    if (req.user) {
-      // Authenticated user - find by userId, ensuring email matches
-      studentProfile = await StudentProfile.findOne({ userId: req.user._id });
-      
-      if (studentProfile) {
-        // Check if they're trying to change phone to one that's already taken by someone else
-        if (studentInfo.mobileNumber !== studentProfile.mobileNumber) {
-          const phoneExists = await StudentProfile.findOne({
-            mobileNumber: studentInfo.mobileNumber,
-            email: email,
-            _id: { $ne: studentProfile._id }
-          });
-          
-          if (phoneExists) {
-            return res.status(409).json({
-              message: 'This phone number is already registered with a different profile',
-              error: 'DUPLICATE_PHONE_EMAIL'
-            });
-          }
-        }
-        
-        // Update existing profile
-        studentProfile.studentName = studentInfo.studentName;
-        studentProfile.schoolName = studentInfo.schoolName;
-        studentProfile.className = studentInfo.className;
-        studentProfile.rollNumber = studentInfo.rollNumber || studentProfile.rollNumber;
-        studentProfile.mobileNumber = studentInfo.mobileNumber;
-        studentProfile.email = email;
-        studentProfile.address = studentInfo.address || studentProfile.address;
-        studentProfile.updatedAt = new Date();
-        await studentProfile.save();
-      } else {
-        // Create new profile
-        studentProfile = new StudentProfile({
-          userId: req.user._id,
-          email: email,
-          studentName: studentInfo.studentName,
-          schoolName: studentInfo.schoolName,
-          className: studentInfo.className,
-          rollNumber: studentInfo.rollNumber || '',
-          mobileNumber: studentInfo.mobileNumber,
-          address: studentInfo.address || ''
-        });
-        await studentProfile.save();
-      }
-    } else {
-      // Public user - find by (mobileNumber + email) composite
-      studentProfile = await StudentProfile.findOne({
-        mobileNumber: studentInfo.mobileNumber,
-        email: email
+      return res.status(400).json({ 
+        message: 'You have already submitted this quiz. No retakes allowed per quiz policy.' 
       });
-      
-      if (studentProfile) {
-        // Update existing profile (same person coming back)
-        studentProfile.studentName = studentInfo.studentName;
-        studentProfile.schoolName = studentInfo.schoolName;
-        studentProfile.className = studentInfo.className;
-        studentProfile.address = studentInfo.address || studentProfile.address;
-        studentProfile.updatedAt = new Date();
-        await studentProfile.save();
-      } else {
-        // Check if this phone exists with DIFFERENT email
-        const phoneWithDifferentEmail = await StudentProfile.findOne({
-          mobileNumber: studentInfo.mobileNumber,
-          email: { $ne: email }
-        });
-        
-        if (phoneWithDifferentEmail) {
-          return res.status(409).json({
-            message: `This phone number is registered to ${phoneWithDifferentEmail.email}. Please use the correct email.`,
-            registeredEmail: phoneWithDifferentEmail.email,
-            error: 'DUPLICATE_PHONE_DIFFERENT_EMAIL'
-          });
-        }
-        
-        // Create new profile
-        studentProfile = new StudentProfile({
-          email: email,
-          studentName: studentInfo.studentName,
-          schoolName: studentInfo.schoolName,
-          className: studentInfo.className,
-          rollNumber: studentInfo.rollNumber || '',
-          mobileNumber: studentInfo.mobileNumber,
-          address: studentInfo.address || ''
-        });
-        await studentProfile.save();
-      }
     }
     
-    studentProfileId = studentProfile._id;
+    // VERSION 2: If profileData provided, update User.profile
+    if (profileData) {
+      await User.findByIdAndUpdate(
+        req.user._id,
+        {
+          $set: {
+            'profile.studentName': profileData.studentName,
+            'profile.schoolName': profileData.schoolName,
+            'profile.className': profileData.className,
+            'profile.rollNumber': profileData.rollNumber || '',
+            'profile.mobileNumber': profileData.mobileNumber || '',
+            'profile.address': profileData.address || '',
+            'profile.updatedAt': new Date()
+          }
+        },
+        { new: true }
+      );
+    }
+    
+    // VERSION 2: DECISION 4 - Check duplicate by class+roll+phone (BLOCK if match)
+    const userProfile = await User.findById(req.user._id).select('profile');
+    
+    if (userProfile?.profile?.className && userProfile?.profile?.rollNumber && userProfile?.profile?.mobileNumber) {
+      const duplicateCheck = await Submission.findOne({
+        quizId: req.params.id,
+        $expr: {
+          $and: [
+            { $eq: ['$quizId', mongoose.Types.ObjectId(req.params.id)] }
+          ]
+        }
+      }).populate('userId', 'profile');
+      
+      // Check if another user with same class+roll+phone already submitted
+      if (duplicateCheck?.userId?.profile) {
+        const otherProfile = duplicateCheck.userId.profile;
+        if (
+          otherProfile.className === userProfile.profile.className &&
+          otherProfile.rollNumber === userProfile.profile.rollNumber &&
+          otherProfile.mobileNumber === userProfile.profile.mobileNumber &&
+          duplicateCheck.userId._id.toString() !== req.user._id.toString()
+        ) {
+          return res.status(400).json({
+            message: 'Duplicate submission detected',
+            details: 'A submission with same class, roll, and phone number already exists for this quiz'
+          });
+        }
+      }
+    }
     
     // Calculate score
     let score = 0;
@@ -619,43 +685,91 @@ app.post('/api/quizzes/:id/submit', optionalAuth, async (req, res) => {
         score += question.points || 1;
       }
       return {
-        questionId: question._id,
+        questionIndex: index,
         selectedOption: answer.selectedOption,
         isCorrect
       };
     });
     
-    const submission = await Submission.create({
-      quizId: req.params.id,
-      userId: req.user ? req.user._id : null,
-      studentProfileId: studentProfileId,
-      answers: processedAnswers,
-      score,
-      totalQuestions: quiz.questions.length,
-      timeTaken
-    });
+    try {
+      // VERSION 2: Create submission with new fields
+      const submission = await Submission.create({
+        quizId: req.params.id,
+        userId: req.user._id,
+        userAnswers: processedAnswers,
+        score,
+        totalQuestions: quiz.questions.length,
+        timeTaken,
+        answersLocked: true,      // VERSION 2: Locked until result published
+        isDuplicateFlag: false    // VERSION 2: No secondary duplicate found
+      });
+      
+      // VERSION 2: DECISION 5 - Update statistics immediately (sequential, no transaction)
+      try {
+        await User.findByIdAndUpdate(
+          req.user._id,
+          {
+            $inc: {
+              'studentStatistics.totalQuizzesAttempted': 1,
+              'studentStatistics.totalPoints': score
+            },
+            $set: {
+              'studentStatistics.lastQuizTakenAt': new Date(),
+              'studentStatistics.lastPointsUpdatedAt': new Date()
+            }
+          }
+        );
+      } catch (statsError) {
+        // Log error but don't fail submission (decision 5: accept partial updates)
+        console.error('⚠️  Warning: Statistics update failed, but submission created:', statsError.message);
+      }
+      
+      // Return submission without correctAnswers (locked)
+      res.status(201).json({
+        _id: submission._id,
+        quizId: submission.quizId,
+        score: submission.score,
+        totalQuestions: submission.totalQuestions,
+        timeTaken: submission.timeTaken,
+        submittedAt: submission.submittedAt,
+        message: 'Submission successful! Correct answers will be shown after result publication.',
+        answersLocked: true
+      });
+      
+    } catch (submitError) {
+      // Handle duplicate key error from database
+      if (submitError.code === 11000) {
+        console.error('❌ E11000 Duplicate submission detected:', submitError.message);
+        return res.status(400).json({ 
+          message: 'You have already submitted this quiz' 
+        });
+      }
+      throw submitError;
+    }
     
-    res.status(201).json(submission);
   } catch (error) {
-    console.error('Error submitting quiz:', error);
-    res.status(400).json({ message: error.message });
+    console.error('❌ Submission error:', error.message);
+    res.status(400).json({ message: error.message || 'Failed to submit quiz' });
   }
 });
 
-// Get leaderboard for a quiz - Populated from StudentProfile
+// Get leaderboard for a quiz - VERSION 2 (Using User.profile instead of StudentProfile)
 app.get('/api/quizzes/:id/leaderboard', async (req, res) => {
   try {
-    const submissions = await Submission.find({ quizId: req.params.id })
-      .populate('studentProfileId', 'studentName schoolName className rollNumber mobileNumber address')
+    const submissions = await Submission.find({ 
+      quizId: req.params.id,
+      isDuplicateFlag: false  // VERSION 2: Exclude flagged duplicates
+    })
+      .populate('userId', 'profile')
       .sort({ score: -1, timeTaken: 1 })
       .limit(100);
     
     const leaderboard = submissions.map((sub, index) => ({
       rank: index + 1,
-      studentName: sub.studentProfileId?.studentName || '',
-      schoolName: sub.studentProfileId?.schoolName || '',
-      className: sub.studentProfileId?.className || '',
-      rollNumber: sub.studentProfileId?.rollNumber || '',
+      studentName: sub.userId?.profile?.studentName || 'Unknown',
+      schoolName: sub.userId?.profile?.schoolName || 'Unknown',
+      className: sub.userId?.profile?.className || 'Unknown',
+      rollNumber: sub.userId?.profile?.rollNumber || '',
       score: sub.score,
       totalQuestions: sub.totalQuestions,
       timeTaken: sub.timeTaken,
@@ -668,28 +782,44 @@ app.get('/api/quizzes/:id/leaderboard', async (req, res) => {
   }
 });
 
-// Get user's submission for a quiz (authenticated users only)
+// Get user's submission for a quiz (authenticated users only) - VERSION 2
 app.get('/api/quizzes/:id/submission', authenticateUser, async (req, res) => {
   try {
     const submission = await Submission.findOne({
       quizId: req.params.id,
       userId: req.user._id
-    }).populate('quizId').populate('studentProfileId', 'studentName schoolName className rollNumber');
+    }).populate('quizId').populate('userId', 'profile');
     
     if (!submission) {
       return res.status(404).json({ message: 'Submission not found' });
     }
     
-    res.json(submission);
+    // VERSION 2: If answers are locked, don't send correct answer info
+    const responseData = {
+      _id: submission._id,
+      quizId: submission.quizId,
+      userId: submission.userId,
+      score: submission.score,
+      totalQuestions: submission.totalQuestions,
+      timeTaken: submission.timeTaken,
+      submittedAt: submission.submittedAt,
+      answersLocked: submission.answersLocked
+    };
+    
+    // Only include user answers if unlocked (after result published)
+    if (!submission.answersLocked) {
+      responseData.userAnswers = submission.userAnswers;
+    }
+    
+    res.json(responseData);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// Get user's submission with complete answer details - works for both authenticated and public users
-app.get('/api/quizzes/:id/my-submission', optionalAuth, async (req, res) => {
+// Get user's submission with complete answer details - VERSION 2 (Auth only)
+app.get('/api/quizzes/:id/my-submission', authenticateUser, async (req, res) => {
   try {
-    const { mobileNumber } = req.query;
     const quizId = req.params.id;
 
     // Get the quiz first to access question details
@@ -698,36 +828,35 @@ app.get('/api/quizzes/:id/my-submission', optionalAuth, async (req, res) => {
       return res.status(404).json({ message: 'Quiz not found' });
     }
 
-    let submission;
-
-    if (req.user) {
-      // Authenticated user - find by userId
-      submission = await Submission.findOne({
-        quizId: quizId,
-        userId: req.user._id
-      });
-    } else if (mobileNumber) {
-      // Public user - find StudentProfile first, then find submission
-      const studentProfile = await StudentProfile.findOne({ mobileNumber });
-      if (studentProfile) {
-        submission = await Submission.findOne({
-          quizId: quizId,
-          studentProfileId: studentProfile._id
-        });
-      }
-    } else {
-      return res.status(400).json({ message: 'Mobile number required for public users' });
-    }
+    // VERSION 2: Get submission for authenticated user
+    const submission = await Submission.findOne({
+      quizId: quizId,
+      userId: req.user._id
+    });
 
     if (!submission) {
       return res.status(404).json({ message: 'No submission found for this quiz' });
     }
 
-    // Enrich answers with question text and options
-    const enrichedAnswers = submission.answers.map((answer, index) => {
+    // VERSION 2: If answers locked, don't return detailed answers
+    if (submission.answersLocked) {
+      return res.json({
+        _id: submission._id,
+        quizId: submission.quizId,
+        score: submission.score,
+        totalQuestions: submission.totalQuestions,
+        timeTaken: submission.timeTaken,
+        submittedAt: submission.submittedAt,
+        answersLocked: true,
+        message: 'Answers are locked until result is published'
+      });
+    }
+
+    // VERSION 2: Return enriched answers with question details
+    const enrichedAnswers = submission.userAnswers.map((answer, index) => {
       const question = quiz.questions[index];
       return {
-        questionId: answer.questionId,
+        questionIndex: answer.questionIndex,
         questionText: question?.question || '',
         selectedOption: question?.options?.[answer.selectedOption] || 'No answer',
         correctOption: question?.options?.[question?.correctAnswer] || '',
@@ -736,28 +865,29 @@ app.get('/api/quizzes/:id/my-submission', optionalAuth, async (req, res) => {
       };
     });
 
-    // Populate studentProfile and return complete submission data
-    await submission.populate('studentProfileId', 'studentName schoolName className rollNumber mobileNumber address');
+    // Populate user and return complete submission data
+    await submission.populate('userId', 'profile');
     
-    const profile = submission.studentProfileId;
+    const profile = submission.userId.profile;
     res.json({
       _id: submission._id,
       quizId: submission.quizId,
-      studentProfileId: submission.studentProfileId._id,
+      userId: submission.userId._id,
       score: submission.score,
       totalQuestions: submission.totalQuestions,
       timeTaken: submission.timeTaken,
       submittedAt: submission.submittedAt,
+      answersLocked: submission.answersLocked,
       studentName: profile?.studentName || '',
       schoolName: profile?.schoolName || '',
       className: profile?.className || '',
       rollNumber: profile?.rollNumber || '',
       mobileNumber: profile?.mobileNumber || '',
       address: profile?.address || '',
-      answers: enrichedAnswers
+      userAnswers: enrichedAnswers
     });
   } catch (error) {
-    console.error('Error fetching submission:', error);
+    console.error('❌ Error fetching submission:', error.message);
     res.status(500).json({ message: error.message });
   }
 });
@@ -849,7 +979,7 @@ app.get('/api/admin/quizzes/:id/prepare-publish/:publishType', authenticateUser,
 app.post('/api/admin/quizzes/:id/publish-results', authenticateUser, isAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { publishType, selectedWinners } = req.body;
+    const { topWinners, topCount } = req.body;  // VERSION 2: admin selects winners
 
     // Get quiz info
     const quiz = await Quiz.findById(id);
@@ -857,65 +987,125 @@ app.post('/api/admin/quizzes/:id/publish-results', authenticateUser, isAdmin, as
       return res.status(404).json({ message: 'Quiz not found' });
     }
 
-    const enrichedWinners = selectedWinners.map((winner, index) => ({
-      studentProfileId: winner.studentProfileId || winner._id,
+    // VERSION 2: Validate winners list - must be userId references with scores
+    if (!Array.isArray(topWinners) || topWinners.length === 0) {
+      return res.status(400).json({ message: 'At least one winner required' });
+    }
+
+    // Check if result already published
+    let existingResult = await PublishedResult.findOne({ quizId: id });
+    if (existingResult) {
+      // VERSION 2: Remove old winner statistics and unlock old answers
+      if (existingResult.topWinners && Array.isArray(existingResult.topWinners)) {
+        for (const winner of existingResult.topWinners) {
+          await User.findByIdAndUpdate(
+            winner.userId,
+            { $inc: { 'studentStatistics.quizzesWon': -1 } }
+          );
+        }
+      }
+    }
+
+    // VERSION 2: Unlock all answers for this quiz
+    await Submission.updateMany(
+      { quizId: id },
+      { $set: { answersLocked: false } }
+    );
+
+    // VERSION 2: Get total submission stats
+    const allSubmissions = await Submission.find({ quizId: id });
+    const uniqueParticipants = new Set(allSubmissions.map(s => s.userId.toString())).size;
+    const topScoreAchieved = Math.max(...allSubmissions.map(s => s.score), 0);
+
+    // VERSION 2: Prepare enriched winners with scores and positions
+    const enrichedWinners = topWinners.map((winner, index) => ({
+      userId: winner.userId || winner._id,
       score: winner.score,
       position: index + 1
     }));
 
-    // Check if result already published
-    const existingResult = await PublishedResult.findOne({ quizId: id });
+    // VERSION 2: Update winner statistics (decision 5: no transaction, sequential)
+    for (const winner of enrichedWinners) {
+      try {
+        await User.findByIdAndUpdate(
+          winner.userId,
+          { $inc: { 'studentStatistics.quizzesWon': 1 } }
+        );
+      } catch (statsError) {
+        console.error('⚠️  Warning: Failed to update winner stats for user:', winner.userId);
+      }
+    }
+
     if (existingResult) {
       // Update existing result
-      existingResult.publishType = publishType;
-      existingResult.winners = enrichedWinners;
+      existingResult.topWinners = enrichedWinners;
+      existingResult.topCountConfigured = topCount || enrichedWinners.length;
+      existingResult.resultMetadata.totalSubmissions = allSubmissions.length;
+      existingResult.resultMetadata.uniqueParticipants = uniqueParticipants;
+      existingResult.resultMetadata.topScoreAchieved = topScoreAchieved;
       existingResult.publishedAt = new Date();
       await existingResult.save();
-      return res.json(existingResult);
+      
+      return res.json({
+        message: 'Result updated and published successfully',
+        result: existingResult
+      });
     }
 
     // Create new published result
     const result = new PublishedResult({
       quizId: id,
-      publishType,
-      winners: enrichedWinners,
-      publishedBy: req.user._id,
-      publishedAt: new Date()
+      isPublished: true,
+      topWinners: enrichedWinners,
+      resultMetadata: {
+        totalSubmissions: allSubmissions.length,
+        uniqueParticipants: uniqueParticipants,
+        duplicateFlagsFiltered: 0,
+        topScoreAchieved: topScoreAchieved,
+        topCountConfigured: topCount || enrichedWinners.length
+      },
+      publishedBy: req.user._id
     });
 
     await result.save();
-    res.json(result);
+    
+    res.json({
+      message: 'Result published successfully',
+      result: result
+    });
+    
   } catch (error) {
-    console.error('Error publishing result:', error);
+    console.error('❌ Error publishing result:', error.message);
     res.status(500).json({ message: error.message || 'Failed to publish result' });
   }
 });
 
-// Get published results for a quiz (public route)
+// Get published results for a quiz (public route) - VERSION 2
 app.get('/api/published-results/:quizId', async (req, res) => {
   try {
     const { quizId } = req.params;
     const result = await PublishedResult.findOne({ quizId })
       .populate('quizId', 'title subtitle')
-      .populate('winners.studentProfileId', 'studentName className schoolName');
+      .populate('topWinners.userId', 'profile name email');
     
     if (!result) {
       return res.status(404).json({ message: 'Result not published yet' });
     }
     
-    // Enrich winners with profile data
-    if (result.winners && Array.isArray(result.winners)) {
-      result.winners = result.winners.map((winner) => ({
+    // VERSION 2: Enrich winners with profile data
+    if (result.topWinners && Array.isArray(result.topWinners)) {
+      result.topWinners = result.topWinners.map((winner) => ({
         ...winner.toObject ? winner.toObject() : winner,
-        studentName: winner.studentProfileId?.studentName,
-        className: winner.studentProfileId?.className,
-        schoolName: winner.studentProfileId?.schoolName,
+        studentName: winner.userId?.profile?.studentName,
+        className: winner.userId?.profile?.className,
+        schoolName: winner.userId?.profile?.schoolName,
+        rollNumber: winner.userId?.profile?.rollNumber
       }));
     }
     
     res.json(result);
   } catch (error) {
-    console.error('Error fetching published result:', error);
+    console.error('❌ Error fetching published result:', error.message);
     res.status(500).json({ message: error.message || 'Failed to fetch result' });
   }
 });
@@ -1107,11 +1297,10 @@ app.get('/api/student-profile', authenticateUser, async (req, res) => {
   }
 });
 
-// PUT /api/student-profile - Update student profile (authenticated user only) - Phone + Email composite
+// PUT /api/student-profile - Update student profile (authenticated user only)
 app.put('/api/student-profile', authenticateUser, async (req, res) => {
   try {
     const { studentName, schoolName, className, rollNumber, mobileNumber, address } = req.body;
-    const email = req.user.email;
 
     // Validation
     if (!studentName || !schoolName || !className || !rollNumber || !mobileNumber || !address) {
@@ -1147,23 +1336,9 @@ app.put('/api/student-profile', authenticateUser, async (req, res) => {
     let studentProfile = await StudentProfile.findOne({ userId: req.user._id });
     
     if (!studentProfile) {
-      // Check if this (phone + email) combo already exists
-      const existingCombo = await StudentProfile.findOne({
-        mobileNumber: mobileNumber,
-        email: email
-      });
-      
-      if (existingCombo) {
-        // Shouldn't happen, but if it does, use existing
-        return res.status(400).json({
-          message: 'This phone and email combination is already registered'
-        });
-      }
-
       // Create new profile
       studentProfile = new StudentProfile({
         userId: req.user._id,
-        email: email,
         studentName,
         schoolName,
         className: classNum.toString(),
@@ -1173,28 +1348,11 @@ app.put('/api/student-profile', authenticateUser, async (req, res) => {
       });
     } else {
       // Update existing profile
-      // Check if changing phone to one that exists with different email
-      if (mobileNumber !== studentProfile.mobileNumber) {
-        const phoneExists = await StudentProfile.findOne({
-          mobileNumber: mobileNumber,
-          email: email,
-          _id: { $ne: studentProfile._id }
-        });
-        
-        if (phoneExists) {
-          return res.status(409).json({
-            message: 'This phone number is already registered to another profile with the same email',
-            error: 'DUPLICATE_PHONE_EMAIL'
-          });
-        }
-      }
-
       studentProfile.studentName = studentName;
       studentProfile.schoolName = schoolName;
       studentProfile.className = classNum.toString();
       studentProfile.rollNumber = rollNumber;
       studentProfile.mobileNumber = mobileNumber;
-      studentProfile.email = email;
       studentProfile.address = address;
       studentProfile.updatedAt = new Date();
     }
@@ -1204,7 +1362,6 @@ app.put('/api/student-profile', authenticateUser, async (req, res) => {
     res.json({ 
       message: 'Student profile updated successfully',
       _id: studentProfile._id,
-      email: studentProfile.email,
       studentName: studentProfile.studentName,
       schoolName: studentProfile.schoolName,
       className: studentProfile.className,
@@ -1215,66 +1372,16 @@ app.put('/api/student-profile', authenticateUser, async (req, res) => {
     });
   } catch (error) {
     console.error('Error updating student profile:', error);
-    if (error.code === 11000) {
-      // Duplicate key error
-      res.status(409).json({ 
-        message: 'This phone number + email combination is already registered',
-        error: 'DUPLICATE_PHONE_EMAIL'
-      });
-    } else {
-      res.status(500).json({ message: error.message || 'Failed to update student profile' });
-    }
+    res.status(500).json({ message: error.message || 'Failed to update student profile' });
   }
 });
 
-// GET /api/student-profile/:mobileNumber/:email - Get student profile by phone + email composite (public users)
-app.get('/api/student-profile/:mobileNumber/:email', async (req, res) => {
-  try {
-    const { mobileNumber, email } = req.params;
-
-    // Find student profile by (mobileNumber + email) composite
-    const studentProfile = await StudentProfile.findOne({ 
-      mobileNumber: mobileNumber,
-      email: email
-    });
-
-    if (!studentProfile) {
-      // Return empty profile if doesn't exist (public user)
-      return res.json({
-        _id: null,
-        email: email,
-        studentName: '',
-        schoolName: '',
-        className: '',
-        rollNumber: '',
-        mobileNumber: mobileNumber,
-        address: ''
-      });
-    }
-
-    res.json({
-      _id: studentProfile._id,
-      email: studentProfile.email,
-      studentName: studentProfile.studentName || '',
-      schoolName: studentProfile.schoolName || '',
-      className: studentProfile.className || '',
-      rollNumber: studentProfile.rollNumber || '',
-      mobileNumber: studentProfile.mobileNumber || '',
-      address: studentProfile.address || '',
-      updatedAt: studentProfile.updatedAt
-    });
-  } catch (error) {
-    console.error('Error fetching student profile:', error);
-    res.status(500).json({ message: error.message || 'Failed to fetch student profile' });
-  }
-});
-
-// GET /api/student-profile/:mobileNumber - Get student profile by mobile number (keep for backward compat but checks all emails)
+// GET /api/student-profile/:mobileNumber - Get student profile by mobile number (public access for returning users)
 app.get('/api/student-profile/:mobileNumber', async (req, res) => {
   try {
     const { mobileNumber } = req.params;
 
-    // Find student profile by mobile number (will return first match)
+    // Find student profile by mobile number
     const studentProfile = await StudentProfile.findOne({ mobileNumber });
 
     if (!studentProfile) {
@@ -1303,43 +1410,6 @@ app.get('/api/student-profile/:mobileNumber', async (req, res) => {
   } catch (error) {
     console.error('Error fetching student profile:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch student profile' });
-  }
-});
-
-// Check if phone + email combination is available (public endpoint for frontend validation)
-app.get('/api/check-phone-email', async (req, res) => {
-  try {
-    const { mobileNumber, email } = req.query;
-    
-    if (!mobileNumber || !email) {
-      return res.status(400).json({ message: 'Phone and email are required' });
-    }
-    
-    // Check for exact match (same email, same phone)
-    const exactMatch = await StudentProfile.findOne({
-      mobileNumber: mobileNumber,
-      email: email
-    });
-    
-    // Check for phone with different email
-    const phoneWithDifferentEmail = await StudentProfile.findOne({
-      mobileNumber: mobileNumber,
-      email: { $ne: email }
-    });
-    
-    res.json({
-      available: !exactMatch,
-      phoneExists: !!phoneWithDifferentEmail,
-      message: exactMatch 
-        ? 'This phone and email combination already exists'
-        : phoneWithDifferentEmail
-        ? `This phone is registered to ${phoneWithDifferentEmail.email}. Use your email to register.`
-        : 'Available',
-      registeredEmail: phoneWithDifferentEmail?.email || null
-    });
-  } catch (error) {
-    console.error('Error checking phone+email availability:', error);
-    res.status(500).json({ message: error.message || 'Failed to check availability' });
   }
 });
 
