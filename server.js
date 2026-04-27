@@ -411,29 +411,14 @@ app.get('/api/quizzes', async (req, res) => {
   }
 });
 
-// Check if user has already submitted a quiz
-app.get('/api/quizzes/:id/check-submission', optionalAuth, async (req, res) => {
+// Check if user has already submitted a quiz - VERSION 2 (Authenticated users only)
+app.get('/api/quizzes/:id/check-submission', authenticateUser, async (req, res) => {
   try {
-    const { mobileNumber } = req.query;
-    
-    let submission;
-    
-    if (req.user) {
-      // Authenticated user - check by userId
-      submission = await Submission.findOne({
-        quizId: req.params.id,
-        userId: req.user._id
-      });
-    } else if (mobileNumber) {
-      // Public user - find StudentProfile first, then check submission
-      const studentProfile = await StudentProfile.findOne({ mobileNumber });
-      if (studentProfile) {
-        submission = await Submission.findOne({
-          quizId: req.params.id,
-          studentProfileId: studentProfile._id
-        });
-      }
-    }
+    // VERSION 2: Only support authenticated users
+    const submission = await Submission.findOne({
+      quizId: req.params.id,
+      userId: req.user._id
+    });
     
     res.json({ 
       hasSubmitted: !!submission,
@@ -653,7 +638,7 @@ app.post('/api/quizzes/:id/submit', authenticateUser, async (req, res) => {
         quizId: req.params.id,
         $expr: {
           $and: [
-            { $eq: ['$quizId', mongoose.Types.ObjectId(req.params.id)] }
+            { $eq: ['$quizId', new mongoose.Types.ObjectId(req.params.id)] }
           ]
         }
       }).populate('userId', 'profile');
@@ -892,18 +877,18 @@ app.get('/api/quizzes/:id/my-submission', authenticateUser, async (req, res) => 
   }
 });
 
-// Admin: Get quiz statistics
+// Admin: Get quiz statistics - VERSION 2 (Using User.profile instead of StudentProfile)
 app.get('/api/admin/quizzes/:id/stats', authenticateUser, isAdmin, async (req, res) => {
   try {
     const submissions = await Submission.find({ quizId: req.params.id })
-      .populate('studentProfileId', 'studentName schoolName className mobileNumber');
+      .populate('userId', 'profile');
     
     const submissionsWithProfile = submissions.map(sub => ({
       ...sub.toObject(),
-      studentName: sub.studentProfileId?.studentName || '',
-      schoolName: sub.studentProfileId?.schoolName || '',
-      className: sub.studentProfileId?.className || '',
-      mobileNumber: sub.studentProfileId?.mobileNumber || ''
+      studentName: sub.userId?.profile?.studentName || '',
+      schoolName: sub.userId?.profile?.schoolName || '',
+      className: sub.userId?.profile?.className || '',
+      mobileNumber: sub.userId?.profile?.mobileNumber || ''
     }));
     
     const stats = {
@@ -942,19 +927,19 @@ app.get('/api/health', (req, res) => {
 
 // Result Publishing Routes
 
-// Get submissions for result publishing (classwise or overall)
+// Get submissions for result publishing (classwise or overall) - VERSION 2 (Using User.profile)
 app.get('/api/admin/quizzes/:id/prepare-publish/:publishType', authenticateUser, isAdmin, async (req, res) => {
   try {
     const { id, publishType } = req.params;
     const submissions = await Submission.find({ quizId: id })
-      .populate('studentProfileId', 'studentName schoolName className rollNumber mobileNumber address')
+      .populate('userId', 'profile')
       .sort({ score: -1 });
 
     if (publishType === 'classwise') {
       // Group by class and get top 3 from each
       const grouped = {};
       submissions.forEach(sub => {
-        const className = sub.studentProfileId?.className || 'Unknown';
+        const className = sub.userId?.profile?.className || 'Unknown';
         if (!grouped[className]) {
           grouped[className] = [];
         }
@@ -1110,27 +1095,33 @@ app.get('/api/published-results/:quizId', async (req, res) => {
   }
 });
 
-// Get all published results
+// Get all published results - VERSION 2 (Using User.profile in winners)
 app.get('/api/published-results', async (req, res) => {
   try {
     let results = await PublishedResult.find()
       .populate('quizId', 'title subtitle')
-      .populate('winners.studentProfileId', 'studentName className schoolName')
       .sort({ publishedAt: -1 });
     
-    // Enrich winners with profile data
-    results = results.map((result) => {
-      const resultObj = result.toObject();
-      if (resultObj.winners && Array.isArray(resultObj.winners)) {
-        resultObj.winners = resultObj.winners.map((winner) => ({
-          ...winner,
-          studentName: winner.studentProfileId?.studentName,
-          className: winner.studentProfileId?.className,
-          schoolName: winner.studentProfileId?.schoolName,
-        }));
-      }
-      return resultObj;
-    });
+    // Enrich winners with profile data from User collection
+    results = await Promise.all(
+      results.map(async (result) => {
+        const resultObj = result.toObject();
+        if (resultObj.topWinners && Array.isArray(resultObj.topWinners)) {
+          resultObj.topWinners = await Promise.all(
+            resultObj.topWinners.map(async (winner) => {
+              const user = await User.findById(winner.userId).select('profile');
+              return {
+                ...winner,
+                studentName: user?.profile?.studentName,
+                className: user?.profile?.className,
+                schoolName: user?.profile?.schoolName,
+              };
+            })
+          );
+        }
+        return resultObj;
+      })
+    );
     
     res.json(results || []);
   } catch (error) {
@@ -1262,156 +1253,8 @@ app.delete('/api/admin/published-results/:id', authenticateUser, isAdmin, async 
 });
 
 // Student Profile Routes - SECURITY: Only authenticated user can view/update their own profile
-// GET /api/student-profile - Fetch student profile by userId (authenticated user only)
-app.get('/api/student-profile', authenticateUser, async (req, res) => {
-  try {
-    // Find student profile by userId
-    const studentProfile = await StudentProfile.findOne({ userId: req.user._id });
-
-    if (!studentProfile) {
-      // Return empty profile if doesn't exist
-      return res.json({
-        _id: null,
-        studentName: '',
-        schoolName: '',
-        className: '',
-        rollNumber: '',
-        mobileNumber: '',
-        address: ''
-      });
-    }
-
-    res.json({
-      _id: studentProfile._id,
-      studentName: studentProfile.studentName || '',
-      schoolName: studentProfile.schoolName || '',
-      className: studentProfile.className || '',
-      rollNumber: studentProfile.rollNumber || '',
-      mobileNumber: studentProfile.mobileNumber || '',
-      address: studentProfile.address || '',
-      updatedAt: studentProfile.updatedAt
-    });
-  } catch (error) {
-    console.error('Error fetching student profile:', error);
-    res.status(500).json({ message: error.message || 'Failed to fetch student profile' });
-  }
-});
-
-// PUT /api/student-profile - Update student profile (authenticated user only)
-app.put('/api/student-profile', authenticateUser, async (req, res) => {
-  try {
-    const { studentName, schoolName, className, rollNumber, mobileNumber, address } = req.body;
-
-    // Validation
-    if (!studentName || !schoolName || !className || !rollNumber || !mobileNumber || !address) {
-      return res.status(400).json({ 
-        message: 'All fields are required' 
-      });
-    }
-
-    // Validate Bangladeshi phone number
-    const banglaPhoneRegex = /^(01[3-9][0-9]{8}|01[3-9][0-9]{8})$/;
-    if (!banglaPhoneRegex.test(mobileNumber)) {
-      return res.status(400).json({ 
-        message: 'Invalid Bangladeshi phone number' 
-      });
-    }
-
-    // Validate roll number (should be numeric)
-    if (!/^\d+$/.test(rollNumber)) {
-      return res.status(400).json({ 
-        message: 'Roll number must be numeric' 
-      });
-    }
-
-    // Validate class (should be 4-12)
-    const classNum = parseInt(className);
-    if (isNaN(classNum) || classNum < 4 || classNum > 12) {
-      return res.status(400).json({ 
-        message: 'Class must be between 4 and 12' 
-      });
-    }
-
-    // Find or create student profile
-    let studentProfile = await StudentProfile.findOne({ userId: req.user._id });
-    
-    if (!studentProfile) {
-      // Create new profile
-      studentProfile = new StudentProfile({
-        userId: req.user._id,
-        studentName,
-        schoolName,
-        className: classNum.toString(),
-        rollNumber,
-        mobileNumber,
-        address
-      });
-    } else {
-      // Update existing profile
-      studentProfile.studentName = studentName;
-      studentProfile.schoolName = schoolName;
-      studentProfile.className = classNum.toString();
-      studentProfile.rollNumber = rollNumber;
-      studentProfile.mobileNumber = mobileNumber;
-      studentProfile.address = address;
-      studentProfile.updatedAt = new Date();
-    }
-    
-    await studentProfile.save();
-
-    res.json({ 
-      message: 'Student profile updated successfully',
-      _id: studentProfile._id,
-      studentName: studentProfile.studentName,
-      schoolName: studentProfile.schoolName,
-      className: studentProfile.className,
-      rollNumber: studentProfile.rollNumber,
-      mobileNumber: studentProfile.mobileNumber,
-      address: studentProfile.address,
-      updatedAt: studentProfile.updatedAt
-    });
-  } catch (error) {
-    console.error('Error updating student profile:', error);
-    res.status(500).json({ message: error.message || 'Failed to update student profile' });
-  }
-});
-
-// GET /api/student-profile/:mobileNumber - Get student profile by mobile number (public access for returning users)
-app.get('/api/student-profile/:mobileNumber', async (req, res) => {
-  try {
-    const { mobileNumber } = req.params;
-
-    // Find student profile by mobile number
-    const studentProfile = await StudentProfile.findOne({ mobileNumber });
-
-    if (!studentProfile) {
-      // Return empty profile if doesn't exist (public user)
-      return res.json({
-        _id: null,
-        studentName: '',
-        schoolName: '',
-        className: '',
-        rollNumber: '',
-        mobileNumber: mobileNumber,
-        address: ''
-      });
-    }
-
-    res.json({
-      _id: studentProfile._id,
-      studentName: studentProfile.studentName || '',
-      schoolName: studentProfile.schoolName || '',
-      className: studentProfile.className || '',
-      rollNumber: studentProfile.rollNumber || '',
-      mobileNumber: studentProfile.mobileNumber || '',
-      address: studentProfile.address || '',
-      updatedAt: studentProfile.updatedAt
-    });
-  } catch (error) {
-    console.error('Error fetching student profile:', error);
-    res.status(500).json({ message: error.message || 'Failed to fetch student profile' });
-  }
-});
+// V2: Old /api/student-profile endpoints removed - use /api/user/profile instead
+// These endpoints are deprecated and only exist for reference in version history
 
 // Admin Student Management Routes
 // GET /api/admin/students - Get all students with optional class filter (admin only)
