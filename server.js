@@ -101,20 +101,46 @@ connectMongoDB().catch(err => {
   process.exit(1);
 });
 
-// ⚠️ FIX: Drop old broken index if it exists (E11000 duplicate key fix)
+// ⚠️ FIX: Drop old broken indexes and recreate correct ones (E11000 duplicate key fix)
 async function cleanupOldIndexes() {
   try {
     const submissionCollection = mongoose.connection.collection('submissions');
     
-    // Try to drop the old broken index
+    // List all indexes to see what we have
+    const allIndexes = await submissionCollection.getIndexes();
+    console.log('📋 Current indexes:', Object.keys(allIndexes));
+    
+    // Try to drop problematic old indexes
+    const oldIndexesToDrop = [
+      'quizId_1_mobileNumber_1',
+      'quizId_1_studentProfileId_1',  // ← Main culprit causing E11000 error
+      'quizId_1',
+      'userId_1'
+    ];
+    
+    for (const indexName of oldIndexesToDrop) {
+      try {
+        if (allIndexes[indexName]) {
+          await submissionCollection.dropIndex(indexName);
+          console.log(`✅ Dropped old index: ${indexName}`);
+        }
+      } catch (err) {
+        if (!err.message.includes('index not found')) {
+          console.error(`⚠️  Error dropping ${indexName}:`, err.message);
+        }
+      }
+    }
+    
+    // Recreate the correct index
     try {
-      await submissionCollection.dropIndex('quizId_1_mobileNumber_1');
-      console.log('✅ Dropped old broken index: quizId_1_mobileNumber_1');
+      await submissionCollection.createIndex(
+        { quizId: 1, userId: 1 },
+        { unique: true, name: 'quizId_1_userId_1' }
+      );
+      console.log('✅ Created correct unique index: (quizId, userId)');
     } catch (err) {
-      if (err.message.includes('index not found')) {
-        console.log('ℹ️  No old index to clean up');
-      } else {
-        console.error('⚠️  Error cleaning up indexes:', err.message);
+      if (!err.message.includes('already exists')) {
+        console.error('⚠️  Error creating index:', err.message);
       }
     }
   } catch (err) {
@@ -600,58 +626,72 @@ app.post('/api/quizzes/:id/submit', authenticateUser, async (req, res) => {
     }
     
     // VERSION 2: DECISION 2 - Check duplicate by userId + quizId (one attempt per quiz)
-    const existingSubmission = await Submission.findOne({
-      quizId: req.params.id,
-      userId: req.user._id
-    });
+    // BUGFIX: More defensive check with better logging
+    let existingSubmission;
+    try {
+      existingSubmission = await Submission.findOne({
+        quizId: req.params.id,
+        userId: req.user._id
+      });
+    } catch (dbError) {
+      console.error('❌ Database error checking submission:', dbError.message);
+      return res.status(500).json({ message: 'Database error during submission check' });
+    }
     
     if (existingSubmission) {
+      console.warn(`⚠️  Submission already exists: User ${req.user._id}, Quiz ${req.params.id}, Submitted at ${existingSubmission.submittedAt}`);
       return res.status(400).json({ 
-        message: 'You have already submitted this quiz. No retakes allowed per quiz policy.' 
+        message: 'You have already submitted this quiz. No retakes allowed per quiz policy.',
+        details: `Your submission was recorded at ${new Date(existingSubmission.submittedAt).toLocaleString()}`
       });
     }
     
     // VERSION 2: If profileData provided, update User.profile
     if (profileData) {
-      await User.findByIdAndUpdate(
-        req.user._id,
-        {
-          $set: {
-            'profile.studentName': profileData.studentName,
-            'profile.schoolName': profileData.schoolName,
-            'profile.className': profileData.className,
-            'profile.rollNumber': profileData.rollNumber || '',
-            'profile.mobileNumber': profileData.mobileNumber || '',
-            'profile.address': profileData.address || '',
-            'profile.updatedAt': new Date()
-          }
-        },
-        { new: true }
-      );
+      try {
+        await User.findByIdAndUpdate(
+          req.user._id,
+          {
+            $set: {
+              'profile.studentName': profileData.studentName,
+              'profile.schoolName': profileData.schoolName,
+              'profile.className': profileData.className,
+              'profile.rollNumber': profileData.rollNumber || '',
+              'profile.mobileNumber': profileData.mobileNumber || '',
+              'profile.address': profileData.address || '',
+              'profile.updatedAt': new Date()
+            }
+          },
+          { new: true }
+        );
+      } catch (updateError) {
+        console.warn('⚠️  Profile update failed (non-critical):', updateError.message);
+        // Continue anyway, profile update is not critical for submission
+      }
     }
     
     // VERSION 2: DECISION 4 - Check duplicate by class+roll+phone (BLOCK if match)
     const userProfile = await User.findById(req.user._id).select('profile');
     
     if (userProfile?.profile?.className && userProfile?.profile?.rollNumber && userProfile?.profile?.mobileNumber) {
-      const duplicateCheck = await Submission.findOne({
-        quizId: req.params.id,
-        $expr: {
-          $and: [
-            { $eq: ['$quizId', new mongoose.Types.ObjectId(req.params.id)] }
-          ]
-        }
+      // Find ANY submission for this quiz with SAME class+roll+phone (but different userId)
+      const duplicateSubmission = await Submission.findOne({
+        quizId: new mongoose.Types.ObjectId(req.params.id)
       }).populate('userId', 'profile');
       
-      // Check if another user with same class+roll+phone already submitted
-      if (duplicateCheck?.userId?.profile) {
-        const otherProfile = duplicateCheck.userId.profile;
+      // Check if found submission belongs to a different user with same profile info
+      if (duplicateSubmission?.userId?.profile) {
+        const otherProfile = duplicateSubmission.userId.profile;
+        const isDifferentUser = duplicateSubmission.userId._id.toString() !== req.user._id.toString();
+        
+        // BUGFIX: Only block if it's a DIFFERENT user with same class+roll+phone
         if (
+          isDifferentUser &&
           otherProfile.className === userProfile.profile.className &&
           otherProfile.rollNumber === userProfile.profile.rollNumber &&
-          otherProfile.mobileNumber === userProfile.profile.mobileNumber &&
-          duplicateCheck.userId._id.toString() !== req.user._id.toString()
+          otherProfile.mobileNumber === userProfile.profile.mobileNumber
         ) {
+          console.warn(`⚠️  Duplicate detected: Quiz ${req.params.id}, User ${req.user._id}, Class/Roll/Phone match with ${duplicateSubmission.userId._id}`);
           return res.status(400).json({
             message: 'Duplicate submission detected',
             details: 'A submission with same class, roll, and phone number already exists for this quiz'
@@ -689,6 +729,8 @@ app.post('/api/quizzes/:id/submit', authenticateUser, async (req, res) => {
         isDuplicateFlag: false    // VERSION 2: No secondary duplicate found
       });
       
+      console.log(`✅ Submission created: User ${req.user._id}, Quiz ${req.params.id}, Score ${score}`);
+      
       // VERSION 2: DECISION 5 - Update statistics immediately (sequential, no transaction)
       try {
         await User.findByIdAndUpdate(
@@ -722,11 +764,12 @@ app.post('/api/quizzes/:id/submit', authenticateUser, async (req, res) => {
       });
       
     } catch (submitError) {
-      // Handle duplicate key error from database
+      // Handle duplicate key error from database (shouldn't happen due to above check, but as safety net)
       if (submitError.code === 11000) {
-        console.error('❌ E11000 Duplicate submission detected:', submitError.message);
+        console.error('❌ E11000 Duplicate key error on submission create:', submitError.message);
         return res.status(400).json({ 
-          message: 'You have already submitted this quiz' 
+          message: 'Submission already exists (database duplicate key)',
+          details: 'This may be due to a network issue or race condition. Please refresh and try again.'
         });
       }
       throw submitError;

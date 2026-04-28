@@ -7,7 +7,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "diagnose": "node diagnose.js"
+    "diagnose": "node diagnose.js",
+    "cleanup:submissions": "node scripts/cleanup-submissions.js",
+    "verify:quiz-health": "node scripts/cleanup-submissions.js",
+    "diagnose:submit-error": "node scripts/diagnose-submit-error.js",
+    "fix:indexes": "node scripts/fix-indexes.js"
   },
   "keywords": [
     "express",
