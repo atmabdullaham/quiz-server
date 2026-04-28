@@ -82,20 +82,18 @@ export function filterQuizzesByBangladeshTime(quizzes) {
     const start = quiz.startDate ? convertUTCToBangladesh(quiz.startDate) : null;
     const end = quiz.endDate ? convertUTCToBangladesh(quiz.endDate) : null;
     
-    // Include if draft
+    // Exclude drafts
     if (quiz.status === 'draft') return false;
     
-    // Include if scheduled and hasn't started yet
-    if (quiz.status === 'scheduled' && start && start > now) return true;
+    // ALWAYS show 'active' quizzes regardless of time
+    if (quiz.status === 'active') return true;
     
-    // Include if active and within time range
-    if (quiz.status === 'active' && start && end) {
-      if (start <= now && end >= now) return true;
-    }
-    
-    // Include scheduled that has started (now active)
-    if (quiz.status === 'scheduled' && start && end) {
-      if (start <= now && end >= now) return true;
+    // Show 'scheduled' quizzes if:
+    // 1. Haven't started yet (upcoming)
+    // 2. Or are within the time window (now active)
+    if (quiz.status === 'scheduled') {
+      if (start && start > now) return true;      // Upcoming
+      if (start && end && start <= now && end >= now) return true;  // Within range
     }
     
     return false;

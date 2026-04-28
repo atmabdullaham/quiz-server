@@ -11,7 +11,10 @@
     "cleanup:submissions": "node scripts/cleanup-submissions.js",
     "verify:quiz-health": "node scripts/cleanup-submissions.js",
     "diagnose:submit-error": "node scripts/diagnose-submit-error.js",
-    "fix:indexes": "node scripts/fix-indexes.js"
+    "fix:indexes": "node scripts/fix-indexes.js",
+    "check:submissions": "node scripts/check-submissions.js",
+    "check:quiz-visibility": "node scripts/check-quiz-visibility.js",
+    "activate:quizzes": "node scripts/activate-quizzes.js"
   },
   "keywords": [
     "express",
