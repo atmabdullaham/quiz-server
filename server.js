@@ -49,7 +49,7 @@ app.use(cors({
 
 
 // MongoDB Connection with Fallback Strategy
-let mongodbUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/quiz-platform';
+let mongodbUri = process.env.MONGODB_URI
 
 const connectMongoDB = async () => {
   try {
@@ -73,7 +73,7 @@ const connectMongoDB = async () => {
       console.log('\n📌 Attempting fallback to local MongoDB...\n');
       
       try {
-        await mongoose.connect('mongodb://localhost:27017/quiz-platform', {
+        await mongoose.connect('mongodb://localhost:27017/test', {
           useNewUrlParser: true,
           useUnifiedTopology: true,
           serverSelectionTimeoutMS: 3000,
@@ -278,11 +278,39 @@ const publishedResultSchema = new mongoose.Schema({
   // VERSION 2: Simple boolean flag for answer unlock
   isPublished: { type: Boolean, default: true },
   
-  // VERSION 2: List of top winners (userId only)
+  // GROUP-WISE RESULTS: Store winners organized by group
+  results: {
+    স্বপ্নিল: {
+      group: String,
+      topWinners: [{
+        userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+        score: Number,
+        position: Number
+      }]
+    },
+    প্রত্যয়: {
+      group: String,
+      topWinners: [{
+        userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+        score: Number,
+        position: Number
+      }]
+    },
+    অগ্রপথিক: {
+      group: String,
+      topWinners: [{
+        userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+        score: Number,
+        position: Number
+      }]
+    }
+  },
+  
+  // LEGACY: Flat list of all winners (for backward compatibility)
   topWinners: [{
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     score: Number,
-    position: Number // 1, 2, 3, etc.
+    position: Number
   }],
   
   // VERSION 2: Metadata about publishing
@@ -291,7 +319,7 @@ const publishedResultSchema = new mongoose.Schema({
     uniqueParticipants: Number,
     duplicateFlagsFiltered: Number,
     topScoreAchieved: Number,
-    topCountConfigured: Number // How many top winners (decision 3: admin decides)
+    topCountConfigured: Number
   },
   
   publishedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -402,8 +430,17 @@ app.post('/auth/register', async (req, res) => {
       });
     }
     
-    res.json(user);
+    // Ensure we return all fields including role
+    const userObj = user.toObject ? user.toObject() : user;
+    console.log("📤 /auth/register returning user:", {
+      email: userObj.email,
+      role: userObj.role,
+      _id: userObj._id
+    });
+    
+    res.json(userObj);
   } catch (error) {
+    console.error("❌ /auth/register error:", error);
     res.status(500).json({ message: error.message });
   }
 });
@@ -924,7 +961,8 @@ app.get('/api/quizzes/:id/my-submission', authenticateUser, async (req, res) => 
 app.get('/api/admin/quizzes/:id/stats', authenticateUser, isAdmin, async (req, res) => {
   try {
     const submissions = await Submission.find({ quizId: req.params.id })
-      .populate('userId', 'profile');
+      .populate('userId', 'profile')
+      .sort({ score: -1, timeTaken: 1 }); // Sort by score DESC, then by timeTaken ASC for tie-breaking
     
     const submissionsWithProfile = submissions.map(sub => ({
       ...sub.toObject(),
@@ -939,7 +977,7 @@ app.get('/api/admin/quizzes/:id/stats', authenticateUser, isAdmin, async (req, r
       averageScore: submissions.reduce((acc, sub) => acc + sub.score, 0) / submissions.length || 0,
       highestScore: Math.max(...submissions.map(sub => sub.score), 0),
       lowestScore: submissions.length > 0 ? Math.min(...submissions.map(sub => sub.score)) : 0,
-      submissions: submissionsWithProfile.sort((a, b) => b.score - a.score)
+      submissions: submissionsWithProfile
     };
     
     res.json(stats);
@@ -948,15 +986,61 @@ app.get('/api/admin/quizzes/:id/stats', authenticateUser, isAdmin, async (req, r
   }
 });
 
-// Admin: Make user admin (for initial setup)
+// Admin: Check if current user is admin
+app.get('/api/admin/check-admin', authenticateUser, (req, res) => {
+  console.log("📋 Admin check for user:", {
+    email: req.user.email,
+    role: req.user.role,
+    userId: req.user._id,
+    hasRole: !!req.user.role
+  });
+  res.json({ 
+    isAdmin: req.user.role === 'admin', 
+    role: req.user.role,
+    email: req.user.email,
+    userId: req.user._id,
+    message: req.user.role === 'admin' ? '✅ User is admin' : '❌ User is not admin'
+  });
+});
+
+// DEBUG: Get current user info
+app.get('/api/auth/me', authenticateUser, (req, res) => {
+  console.log("🔍 DEBUG: Returning current user for email:", req.user.email);
+  res.json({
+    email: req.user.email,
+    name: req.user.name,
+    role: req.user.role,
+    _id: req.user._id,
+    firebaseUid: req.user.firebaseUid,
+    picture: req.user.picture,
+    profile: req.user.profile,
+    studentStatistics: req.user.studentStatistics
+  });
+});
+
+// Admin: Make user admin (requires current admin OR setup token)
 app.post('/api/admin/make-admin', authenticateUser, async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, setupToken } = req.body;
+    
+    // Check if requestor is admin or has valid setup token
+    const isCurrentUserAdmin = req.user.role === 'admin';
+    const isValidSetupToken = setupToken === process.env.ADMIN_SETUP_TOKEN;
+    
+    if (!isCurrentUserAdmin && !isValidSetupToken) {
+      return res.status(403).json({ message: 'Forbidden: Admin access required or invalid setup token' });
+    }
+    
     const user = await User.findOneAndUpdate(
       { email },
       { role: 'admin' },
       { new: true }
     );
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
     res.json(user);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -975,8 +1059,8 @@ app.get('/api/admin/quizzes/:id/prepare-publish/:publishType', authenticateUser,
   try {
     const { id, publishType } = req.params;
     const submissions = await Submission.find({ quizId: id })
-      .populate('userId', 'profile')
-      .sort({ score: -1 });
+      .populate('userId', 'profile name email')
+      .sort({ score: -1, timeTaken: 1 }); // Consistent sorting: by score DESC, then timeTaken ASC
 
     if (publishType === 'classwise') {
       // Group by class and get top 3 from each
@@ -1007,7 +1091,7 @@ app.get('/api/admin/quizzes/:id/prepare-publish/:publishType', authenticateUser,
 app.post('/api/admin/quizzes/:id/publish-results', authenticateUser, isAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { topWinners, topCount } = req.body;  // VERSION 2: admin selects winners
+    const { results, topWinners: legacyTopWinners, topCount } = req.body;
 
     // Get quiz info
     const quiz = await Quiz.findById(id);
@@ -1015,15 +1099,50 @@ app.post('/api/admin/quizzes/:id/publish-results', authenticateUser, isAdmin, as
       return res.status(404).json({ message: 'Quiz not found' });
     }
 
-    // VERSION 2: Validate winners list - must be userId references with scores
-    if (!Array.isArray(topWinners) || topWinners.length === 0) {
+    // Process group-wise results
+    let groupWiseResults = {};
+    let flattenedWinners = [];
+    let hasAnyWinners = false;
+
+    if (results && typeof results === 'object') {
+      // New format: Save winners organized by group
+      Object.entries(results).forEach(([groupKey, groupData]) => {
+        if (groupData.topWinners && Array.isArray(groupData.topWinners)) {
+          // Enrich winners with position
+          const enrichedWinners = groupData.topWinners.map((winner, idx) => ({
+            userId: winner.userId || winner._id,
+            score: winner.score,
+            position: idx + 1
+          }));
+          
+          groupWiseResults[groupKey] = {
+            group: groupData.group || groupKey,
+            topWinners: enrichedWinners
+          };
+          
+          flattenedWinners.push(...enrichedWinners);
+          if (enrichedWinners.length > 0) hasAnyWinners = true;
+        }
+      });
+    } else if (Array.isArray(legacyTopWinners)) {
+      // Legacy format: use topWinners directly
+      flattenedWinners = legacyTopWinners.map((winner, idx) => ({
+        userId: winner.userId || winner._id,
+        score: winner.score,
+        position: idx + 1
+      }));
+      hasAnyWinners = true;
+    }
+
+    // Validate at least one winner exists
+    if (!hasAnyWinners || flattenedWinners.length === 0) {
       return res.status(400).json({ message: 'At least one winner required' });
     }
 
     // Check if result already published
     let existingResult = await PublishedResult.findOne({ quizId: id });
     if (existingResult) {
-      // VERSION 2: Remove old winner statistics and unlock old answers
+      // Remove old winner statistics
       if (existingResult.topWinners && Array.isArray(existingResult.topWinners)) {
         for (const winner of existingResult.topWinners) {
           await User.findByIdAndUpdate(
@@ -1034,26 +1153,19 @@ app.post('/api/admin/quizzes/:id/publish-results', authenticateUser, isAdmin, as
       }
     }
 
-    // VERSION 2: Unlock all answers for this quiz
+    // Unlock all answers for this quiz
     await Submission.updateMany(
       { quizId: id },
       { $set: { answersLocked: false } }
     );
 
-    // VERSION 2: Get total submission stats
+    // Get total submission stats
     const allSubmissions = await Submission.find({ quizId: id });
     const uniqueParticipants = new Set(allSubmissions.map(s => s.userId.toString())).size;
     const topScoreAchieved = Math.max(...allSubmissions.map(s => s.score), 0);
 
-    // VERSION 2: Prepare enriched winners with scores and positions
-    const enrichedWinners = topWinners.map((winner, index) => ({
-      userId: winner.userId || winner._id,
-      score: winner.score,
-      position: index + 1
-    }));
-
-    // VERSION 2: Update winner statistics (decision 5: no transaction, sequential)
-    for (const winner of enrichedWinners) {
+    // Update winner statistics
+    for (const winner of flattenedWinners) {
       try {
         await User.findByIdAndUpdate(
           winner.userId,
@@ -1064,13 +1176,25 @@ app.post('/api/admin/quizzes/:id/publish-results', authenticateUser, isAdmin, as
       }
     }
 
+    // Prepare result document
+    const resultDocument = {
+      quizId: id,
+      isPublished: true,
+      results: groupWiseResults,
+      topWinners: flattenedWinners,
+      resultMetadata: {
+        totalSubmissions: allSubmissions.length,
+        uniqueParticipants: uniqueParticipants,
+        duplicateFlagsFiltered: 0,
+        topScoreAchieved: topScoreAchieved,
+        topCountConfigured: topCount || flattenedWinners.length
+      },
+      publishedBy: req.user._id
+    };
+
     if (existingResult) {
       // Update existing result
-      existingResult.topWinners = enrichedWinners;
-      existingResult.topCountConfigured = topCount || enrichedWinners.length;
-      existingResult.resultMetadata.totalSubmissions = allSubmissions.length;
-      existingResult.resultMetadata.uniqueParticipants = uniqueParticipants;
-      existingResult.resultMetadata.topScoreAchieved = topScoreAchieved;
+      Object.assign(existingResult, resultDocument);
       existingResult.publishedAt = new Date();
       await existingResult.save();
       
@@ -1081,20 +1205,7 @@ app.post('/api/admin/quizzes/:id/publish-results', authenticateUser, isAdmin, as
     }
 
     // Create new published result
-    const result = new PublishedResult({
-      quizId: id,
-      isPublished: true,
-      topWinners: enrichedWinners,
-      resultMetadata: {
-        totalSubmissions: allSubmissions.length,
-        uniqueParticipants: uniqueParticipants,
-        duplicateFlagsFiltered: 0,
-        topScoreAchieved: topScoreAchieved,
-        topCountConfigured: topCount || enrichedWinners.length
-      },
-      publishedBy: req.user._id
-    });
-
+    const result = new PublishedResult(resultDocument);
     await result.save();
     
     res.json({
@@ -1120,18 +1231,47 @@ app.get('/api/published-results/:quizId', async (req, res) => {
       return res.status(404).json({ message: 'Result not published yet' });
     }
     
-    // VERSION 2: Enrich winners with profile data
-    if (result.topWinners && Array.isArray(result.topWinners)) {
-      result.topWinners = result.topWinners.map((winner) => ({
-        ...winner.toObject ? winner.toObject() : winner,
-        studentName: winner.userId?.profile?.studentName,
-        className: winner.userId?.profile?.className,
-        schoolName: winner.userId?.profile?.schoolName,
-        rollNumber: winner.userId?.profile?.rollNumber
-      }));
+    const resultObj = result.toObject();
+    
+    // Helper function to enrich a winner with profile data
+    const enrichWinner = async (winner) => {
+      const user = await User.findById(winner.userId).select('profile');
+      return {
+        ...winner,
+        studentName: user?.profile?.studentName,
+        className: user?.profile?.className,
+        schoolName: user?.profile?.schoolName,
+        rollNumber: user?.profile?.rollNumber,
+        phoneNumber: user?.profile?.mobileNumber,
+      };
+    };
+    
+    // Enrich flat topWinners list (backward compatibility)
+    if (resultObj.topWinners && Array.isArray(resultObj.topWinners)) {
+      resultObj.topWinners = await Promise.all(
+        resultObj.topWinners.map(enrichWinner)
+      );
     }
     
-    res.json(result);
+    // Enrich group-wise results
+    if (resultObj.results && typeof resultObj.results === "object") {
+      const enrichedResults = {};
+      for (const [groupKey, groupData] of Object.entries(resultObj.results)) {
+        if (groupData.topWinners && Array.isArray(groupData.topWinners)) {
+          enrichedResults[groupKey] = {
+            ...groupData,
+            topWinners: await Promise.all(
+              groupData.topWinners.map(enrichWinner)
+            )
+          };
+        } else {
+          enrichedResults[groupKey] = groupData;
+        }
+      }
+      resultObj.results = enrichedResults;
+    }
+    
+    res.json(resultObj);
   } catch (error) {
     console.error('❌ Error fetching published result:', error.message);
     res.status(500).json({ message: error.message || 'Failed to fetch result' });
@@ -1149,19 +1289,45 @@ app.get('/api/published-results', async (req, res) => {
     results = await Promise.all(
       results.map(async (result) => {
         const resultObj = result.toObject();
+        
+        // Helper function to enrich a winner with profile data
+        const enrichWinner = async (winner) => {
+          const user = await User.findById(winner.userId).select('profile');
+          return {
+            ...winner,
+            studentName: user?.profile?.studentName,
+            className: user?.profile?.className,
+            schoolName: user?.profile?.schoolName,
+            rollNumber: user?.profile?.rollNumber,
+            phoneNumber: user?.profile?.mobileNumber,
+          };
+        };
+        
+        // Enrich flat topWinners list (backward compatibility)
         if (resultObj.topWinners && Array.isArray(resultObj.topWinners)) {
           resultObj.topWinners = await Promise.all(
-            resultObj.topWinners.map(async (winner) => {
-              const user = await User.findById(winner.userId).select('profile');
-              return {
-                ...winner,
-                studentName: user?.profile?.studentName,
-                className: user?.profile?.className,
-                schoolName: user?.profile?.schoolName,
-              };
-            })
+            resultObj.topWinners.map(enrichWinner)
           );
         }
+        
+        // Enrich group-wise results
+        if (resultObj.results && typeof resultObj.results === "object") {
+          const enrichedResults = {};
+          for (const [groupKey, groupData] of Object.entries(resultObj.results)) {
+            if (groupData.topWinners && Array.isArray(groupData.topWinners)) {
+              enrichedResults[groupKey] = {
+                ...groupData,
+                topWinners: await Promise.all(
+                  groupData.topWinners.map(enrichWinner)
+                )
+              };
+            } else {
+              enrichedResults[groupKey] = groupData;
+            }
+          }
+          resultObj.results = enrichedResults;
+        }
+        
         return resultObj;
       })
     );
@@ -1301,6 +1467,7 @@ app.delete('/api/admin/published-results/:id', authenticateUser, isAdmin, async 
 
 // Admin Student Management Routes
 // GET /api/admin/students - Get all students with optional class filter (admin only)
+// VERSION 2: Updated to use User.profile instead of deprecated StudentProfile
 app.get('/api/admin/students', authenticateUser, isAdmin, async (req, res) => {
   try {
     const { className, page = 1, limit = 20 } = req.query;
@@ -1308,31 +1475,44 @@ app.get('/api/admin/students', authenticateUser, isAdmin, async (req, res) => {
     const limitNum = parseInt(limit);
     const skip = (pageNum - 1) * limitNum;
 
-    // Build filter
+    // Build filter for User collection - filter on profile.className
     const filter = {};
     if (className && className.trim()) {
-      filter.className = className.trim();
+      filter['profile.className'] = className.trim();
     }
 
     // Get total count
-    const totalStudents = await StudentProfile.countDocuments(filter);
+    const totalStudents = await User.countDocuments(filter);
 
-    // Get paginated results
-    const students = await StudentProfile.find(filter)
-      .sort({ createdAt: -1 })
+    // Get paginated results from User collection
+    const users = await User.find(filter)
+      .sort({ 'profile.updatedAt': -1 })
       .skip(skip)
       .limit(limitNum)
-      .select('_id studentName schoolName className rollNumber mobileNumber address createdAt');
+      .select('_id profile createdAt');
+
+    // Map User data to StudentProfile format for frontend compatibility
+    const students = users.map(user => ({
+      _id: user._id,
+      studentName: user.profile?.studentName || '',
+      schoolName: user.profile?.schoolName || '',
+      className: user.profile?.className || '',
+      rollNumber: user.profile?.rollNumber || '',
+      mobileNumber: user.profile?.mobileNumber || '',
+      address: user.profile?.address || '',
+      createdAt: user.createdAt
+    }));
 
     // Get unique classes for filtering
-    const allClasses = await StudentProfile.distinct('className');
+    const classResults = await User.distinct('profile.className', { 'profile.className': { $exists: true, $ne: null } });
+    const allClasses = classResults.filter(c => c).sort();
 
     res.json({
       students,
       totalStudents,
       totalPages: Math.ceil(totalStudents / limitNum),
       currentPage: pageNum,
-      classes: allClasses.sort()
+      classes: allClasses
     });
   } catch (error) {
     console.error('Error fetching students:', error);
@@ -1341,19 +1521,35 @@ app.get('/api/admin/students', authenticateUser, isAdmin, async (req, res) => {
 });
 
 // DELETE /api/admin/students/:id - Delete a student profile (admin only)
+// VERSION 2: Updated to use User collection instead of deprecated StudentProfile
 app.delete('/api/admin/students/:id', authenticateUser, isAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const studentProfile = await StudentProfile.findByIdAndDelete(id);
+    // Find and delete from User collection, clearing profile data
+    const user = await User.findByIdAndUpdate(
+      id,
+      {
+        $set: {
+          'profile.studentName': '',
+          'profile.schoolName': '',
+          'profile.className': '',
+          'profile.rollNumber': '',
+          'profile.mobileNumber': '',
+          'profile.address': '',
+          'profile.updatedAt': new Date()
+        }
+      },
+      { new: true }
+    );
 
-    if (!studentProfile) {
-      return res.status(404).json({ message: 'Student profile not found' });
+    if (!user) {
+      return res.status(404).json({ message: 'Student not found' });
     }
 
     res.json({ 
-      message: 'Student profile deleted successfully',
-      deletedStudent: studentProfile.studentName
+      message: 'Student profile cleared successfully',
+      deletedStudent: user.profile?.studentName || 'Unknown'
     });
   } catch (error) {
     console.error('Error deleting student:', error);
