@@ -189,6 +189,16 @@ const userSchema = new mongoose.Schema({
     lastPointsUpdatedAt: Date
   },
   
+  // VERSION 3: Membership tracking
+  membership: {
+    status: { type: String, enum: ['inactive', 'pending', 'active', 'rejected'], default: 'inactive' },
+    membershipDate: Date,        // Date when membership became active (approval date)
+    requestedAt: Date,           // When user submitted membership request
+    reviewedAt: Date,            // When admin reviewed the request
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },  // Admin who reviewed
+    rejectionReason: String      // Reason if membership was rejected
+  },
+  
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -197,6 +207,8 @@ const userSchema = new mongoose.Schema({
 userSchema.index({ 'profile.mobileNumber': 1 });      // NOT unique (decision 1)
 userSchema.index({ 'profile.className': 1 });
 userSchema.index({ 'profile.rollNumber': 1 });
+userSchema.index({ 'membership.status': 1 });         // For admin queries
+userSchema.index({ 'membership.requestedAt': 1 });    // For sorting by request time
 
 const User = mongoose.model('User', userSchema);
 
@@ -637,6 +649,169 @@ app.get('/api/user/statistics', authenticateUser, async (req, res) => {
         lastQuizTakenAt: null,
         lastPointsUpdatedAt: null
       }
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ==================== MEMBERSHIP ROUTES ====================
+
+// Get current user's membership status
+app.get('/api/user/membership', authenticateUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('membership profile email name');
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    res.json({
+      _id: user._id,
+      email: user.email,
+      name: user.name,
+      membership: user.membership || {
+        status: 'inactive',
+        membershipDate: null,
+        requestedAt: null,
+        reviewedAt: null,
+        reviewedBy: null,
+        rejectionReason: null
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Submit membership application (user applies for membership)
+app.post('/api/membership/apply', authenticateUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    // Check if already pending or active
+    if (user.membership && (user.membership.status === 'pending' || user.membership.status === 'active')) {
+      return res.status(400).json({ 
+        message: `Already in ${user.membership.status} status. Cannot apply again.` 
+      });
+    }
+    
+    // Update membership status to pending
+    user.membership = {
+      status: 'pending',
+      membershipDate: null,
+      requestedAt: new Date(),
+      reviewedAt: null,
+      reviewedBy: null,
+      rejectionReason: null
+    };
+    
+    await user.save();
+    
+    res.json({
+      message: 'আপনার আবেদন সফলভাবে জমা হয়েছে। প্রশাসক পর্যালোচনা করবেন।',
+      membership: user.membership
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Get all pending membership requests (admin only)
+app.get('/api/admin/membership/requests', authenticateUser, isAdmin, async (req, res) => {
+  try {
+    const { status = 'pending' } = req.query;
+    
+    // Build filter
+    const filter = {};
+    if (status) {
+      filter['membership.status'] = status;
+    }
+    
+    const requests = await User.find(filter)
+      .select('_id email name picture profile membership createdAt')
+      .sort({ 'membership.requestedAt': -1 });
+    
+    res.json({
+      total: requests.length,
+      requests: requests
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Approve membership (admin only)
+app.patch('/api/admin/membership/:userId/approve', authenticateUser, isAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const user = await User.findById(userId);
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    // Check if pending
+    if (user.membership?.status !== 'pending') {
+      return res.status(400).json({ 
+        message: 'Only pending requests can be approved' 
+      });
+    }
+    
+    // Update membership
+    user.membership.status = 'active';
+    user.membership.membershipDate = new Date();
+    user.membership.reviewedAt = new Date();
+    user.membership.reviewedBy = req.user._id;
+    user.membership.rejectionReason = null;
+    
+    await user.save();
+    
+    res.json({
+      message: 'সদস্যপদ অনুমোদিত হয়েছে',
+      membership: user.membership
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Reject membership (admin only)
+app.patch('/api/admin/membership/:userId/reject', authenticateUser, isAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { reason = 'প্রশাসক দ্বারা প্রত্যাখ্যান করা হয়েছে' } = req.body;
+    
+    const user = await User.findById(userId);
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    // Check if pending
+    if (user.membership?.status !== 'pending') {
+      return res.status(400).json({ 
+        message: 'Only pending requests can be rejected' 
+      });
+    }
+    
+    // Update membership
+    user.membership.status = 'rejected';
+    user.membership.membershipDate = null;
+    user.membership.reviewedAt = new Date();
+    user.membership.reviewedBy = req.user._id;
+    user.membership.rejectionReason = reason;
+    
+    await user.save();
+    
+    res.json({
+      message: 'সদস্যপদ প্রত্যাখ্যান করা হয়েছে',
+      membership: user.membership
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
