@@ -444,15 +444,8 @@ app.post('/auth/register', async (req, res) => {
     
     // Ensure we return all fields including role
     const userObj = user.toObject ? user.toObject() : user;
-    console.log("📤 /auth/register returning user:", {
-      email: userObj.email,
-      role: userObj.role,
-      _id: userObj._id
-    });
-    
     res.json(userObj);
   } catch (error) {
-    console.error("❌ /auth/register error:", error);
     res.status(500).json({ message: error.message });
   }
 });
@@ -941,8 +934,6 @@ app.post('/api/quizzes/:id/submit', authenticateUser, async (req, res) => {
         isDuplicateFlag: false    // VERSION 2: No secondary duplicate found
       });
       
-      console.log(`✅ Submission created: User ${req.user._id}, Quiz ${req.params.id}, Score ${score}`);
-      
       // VERSION 2: DECISION 5 - Update statistics immediately (sequential, no transaction)
       try {
         await User.findByIdAndUpdate(
@@ -1163,12 +1154,6 @@ app.get('/api/admin/quizzes/:id/stats', authenticateUser, isAdmin, async (req, r
 
 // Admin: Check if current user is admin
 app.get('/api/admin/check-admin', authenticateUser, (req, res) => {
-  console.log("📋 Admin check for user:", {
-    email: req.user.email,
-    role: req.user.role,
-    userId: req.user._id,
-    hasRole: !!req.user.role
-  });
   res.json({ 
     isAdmin: req.user.role === 'admin', 
     role: req.user.role,
@@ -1178,9 +1163,8 @@ app.get('/api/admin/check-admin', authenticateUser, (req, res) => {
   });
 });
 
-// DEBUG: Get current user info
+// Get current user info
 app.get('/api/auth/me', authenticateUser, (req, res) => {
-  console.log("🔍 DEBUG: Returning current user for email:", req.user.email);
   res.json({
     email: req.user.email,
     name: req.user.name,
